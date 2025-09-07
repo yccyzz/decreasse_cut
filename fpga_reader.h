@@ -14,7 +14,16 @@
 #include <climits>
 #include <chrono>
 #include <iomanip>
+#include <cctype>
+#include<queue>
+#include <numeric>
 
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <string>
+#include <array>
+#include <map>
 struct Point {
     std::string name;
     int y = 0;
@@ -27,35 +36,35 @@ struct Point {
     Point(Point&&) = default;
     Point& operator=(const Point&) = default;
     Point& operator=(Point&&) = default;
+    Point(const std::string& n) : name(n) {}
 };
 
 class FPGAReader {
 public:
     bool readPlaceFile(const std::string& file_name);
-    bool readNetFile(const std::string& file_name);
+    bool readNetFile(std::string& file_name);
     bool parsePlacement(const std::string& line, Point& p);
-    void parseNet(const std::string& content);
-    void buildIndexes();
+    void parseNet(std::string& content);
     void print_Info() const;
     void FM();
-    const std::vector<Point>& getPoints() const { return points; }
+    void clear();
+    const std::unordered_map<std::string, Point>& getPoints() const { return points; }
     size_t getPointCount() const { return points.size(); }
     int calculateCutSize() const;
 
 private:
-    std::vector<Point> points;
-    std::unordered_map<std::string, size_t> inst_map;
-    std::unordered_map<std::string, std::vector<size_t>> net_map;
-
+    std::unordered_map<std::string, Point> points;
+    std::unordered_map<std::string, std::unordered_set<std::string>> net_map;
+    std::unordered_map<int, std::unordered_set<std::string>> gain_map;
+    std::unordered_map<std::string, int> cached_gains;
+    int max_gain = -INT32_MAX;
+    std::string max_gain_point_name;
     mutable std::unordered_map<std::string, std::array<int, 2>> net_cache;
-    mutable std::vector<int> cached_gains;
-    mutable bool gains_initialized = false;
 
-    void initial_Gain();
+
+    void initSortedGains();
+    void updateSortedGains(const std::string& moved_name);
     std::array<int, 2> NetStats(const std::string& net_id) const;
-    int Point_Gain(size_t point_idx) const;
-    void updateGain(size_t moved_idx);
-    void updateAllGains() const;
+    int Point_Gain(const std::string& point_name) const;
 };
-
 #endif // FPGA_READER_H

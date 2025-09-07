@@ -7,20 +7,31 @@ bool FPGAReader::readPlaceFile(const std::string& file_name) {
         return false;
     }
 
+    // 清空所有数据
+    clear();
+
     std::string line;
+    points.reserve(50000);
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
         Point p;
         if (parsePlacement(line, p)) {
             p.die = (p.y < 120) ? 0 : 1;
-            inst_map[p.name] = points.size();
-            points.push_back(std::move(p));
+            points.insert({p.name, std::move(p)});
         }
     }
+
     return true;
 }
 
-bool FPGAReader::readNetFile(const std::string& file_name) {
+void FPGAReader::clear() {
+    points.clear();
+    net_map.clear();
+    net_cache.clear();
+    cached_gains.clear();
+}
+
+bool FPGAReader::readNetFile(std::string& file_name) {
     std::ifstream ifs(file_name);
     if (!ifs) {
         std::cerr << "cannot open " << file_name << "\n";
@@ -46,56 +57,233 @@ bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
     return true;
 }
 
-void FPGAReader::parseNet(const std::string& content) {
-    std::string compact = content;
-    std::replace(compact.begin(), compact.end(), '\n', ' ');
+void FPGAReader::parseNet(std::string& content) {
+    std::replace(content.begin(), content.end(), '\n', ' ');
     std::regex inst_re(R"([\w]+\s+([\w.]+)\s*\((.*?)\);)", std::regex::icase);
-    auto it  = std::sregex_iterator(compact.begin(), compact.end(), inst_re);
-    auto end = std::sregex_iterator();
+    std::regex net_re(R"(\.\w+\(([\w.]+)\))");
 
-    for (; it != end; ++it) {
-        const std::smatch& m = *it;
-        if (m.size() < 2)
-            continue;
-
+    // 使用string来临时存储，然后转为string
+    std::unordered_map<std::string, std::vector<std::string>> temp_point_nets;
+    std::unordered_map<std::string, std::unordered_set<std::string>> temp_net_to_points;
+    temp_point_nets.reserve(points.size());
+    temp_net_to_points.reserve(points.size());
+    net_map.reserve(50000);
+    // 第一步：解析每个实例的网络连接
+    for (std::sregex_iterator it(content.begin(), content.end(), inst_re), end; it != end; ++it) {
+        const auto& m = *it;
         std::string inst_name = m[1].str();
-        std::string conn      = m[2].str();
-        std::vector<std::string> nets;
-        std::regex net_re(R"(\.\w+\(([\w.]+)\))");
-        auto net_it  = std::sregex_iterator(conn.begin(), conn.end(), net_re);
-        auto net_end = std::sregex_iterator();
+        std::string conn = m[2].str();
 
-        for (; net_it != net_end; ++net_it) {
-            nets.push_back((*net_it)[1].str());
+        if (!points.contains(inst_name)) {
+            continue;
         }
 
-        auto map_it = inst_map.find(inst_name);
-        if (map_it != inst_map.end()) {
-            size_t idx = map_it->second;
-            points[idx].nets = std::move(nets);
+        for (auto net_it = std::sregex_iterator(conn.begin(), conn.end(), net_re);
+            net_it != std::sregex_iterator(); ++net_it) {
+            std::string net_name = (*net_it)[1].str();
+            temp_point_nets[inst_name].emplace_back(net_name);
+            temp_net_to_points[net_name].insert(inst_name);
         }
+    }
+
+    // 第二步：构建最终的net_map（从网络到点的映射）
+    for (const auto& [net_name, point_list] : temp_net_to_points) {
+        auto& net_points = net_map[net_name];
+        net_points.reserve(point_list.size());
+        for (const auto& point_name_str : point_list) {
+            if (points.contains(point_name_str)) {
+                net_points.insert(point_name_str);
+            }
+        }
+    }
+
+    // 第三步：为每个Point填充nets字段
+    for (auto& [point_name_sv, point] : points) {
+        point.nets.clear();
+        if (temp_point_nets.contains(point.name)) {
+            const auto& net_list = temp_point_nets[point.name];
+            point.nets.reserve(net_list.size());
+            for (const auto& net_name : net_list) {
+                point.nets.emplace_back(net_name);
+            }
+        }
+    }
+
+    std::cout << "Parsed " << net_map.size() << " nets connecting " << points.size() << " points" << std::endl;
+}
+
+int FPGAReader::calculateCutSize() const {
+    int cut_size = 0;
+
+    // 遍历所有网络，统计跨分区的网络数量
+    for (const auto& [net_name, point_set] : net_map) {
+        bool has_die0 = false, has_die1 = false;
+
+        // 检查网络中的点分布在哪些分区
+        for (const std::string& point_name : point_set) {
+            if (auto it = points.find(point_name); it != points.end()) {
+                if (it->second.die == 0) has_die0 = true;
+                else if (it->second.die == 1) has_die1 = true;
+
+                // 如果同时存在于两个分区，这是一个割边
+                if (has_die0 && has_die1) {
+                    cut_size++;
+                    break;
+                }
+            }
+        }
+    }
+    return cut_size;
+}
+
+void FPGAReader::FM() {
+    if (points.empty()) return;
+    auto cutsize_start = std::chrono::high_resolution_clock::now();
+    int initial_cut_size = calculateCutSize();
+    auto cutsize_end = std::chrono::high_resolution_clock::now();
+    std::cout << "CutSize time: " << std::chrono::duration<double>(cutsize_end - cutsize_start).count() << std::endl;
+    std::cout << "Initial cut size: " << initial_cut_size << std::endl;
+
+    // 重置所有点状态
+//    for (auto& [name, point] : points) {
+//        point.is_fixed = false;
+//    }
+    auto init_gain_start = std::chrono::high_resolution_clock::now();
+    // 初始化排序的增益表
+    initSortedGains();
+    auto init_gain_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Init gain time: " << std::chrono::duration<double>(init_gain_end - init_gain_start).count() << std::endl;
+
+
+    // FM Pass - 严格只移动正增益点
+    while (!gain_map.empty() && max_gain > 0) {
+        // 获取最大增益的点（严格 > 0）
+        // 从排序表中移除
+        gain_map[max_gain].erase(max_gain_point_name);
+        max_gain = -INT32_MAX;
+        // 执行移动
+        points[max_gain_point_name].die = 1 - points[max_gain_point_name].die;
+        points[max_gain_point_name].is_fixed = true;
+
+        auto update_gain_start = std::chrono::high_resolution_clock::now();
+        updateSortedGains(max_gain_point_name);
+        max_gain = -INT32_MAX;
+        for (const auto& gain : gain_map) {
+            if (gain.second.empty()) {
+                continue;
+            }
+            if (gain.first > max_gain) {
+                max_gain = gain.first;
+                max_gain_point_name = *gain.second.begin();
+            }
+        }
+        auto update_gain_end = std::chrono::high_resolution_clock::now();
+//        std::cout << "Update gain time: " << std::chrono::duration<double>(update_gain_end - update_gain_start).count() << std::endl;
+    }
+
+    std::cout << "Final cut size: " << calculateCutSize() << std::endl;
+    std::cout << "Improvement: " << (initial_cut_size - calculateCutSize()) << std::endl;
+}
+
+void FPGAReader::initSortedGains() {
+    gain_map.clear();
+    net_cache.clear();
+    cached_gains.clear();
+    cached_gains.reserve(points.size());
+
+    // 计算所有点的增益并排序
+    for (const auto& [name, point] : points) {
+        int gain = Point_Gain(name);
+        if (gain > max_gain) {
+            max_gain = gain;
+            max_gain_point_name = name;
+        }
+        cached_gains[name] = gain;
+        gain_map[gain].insert(name);
     }
 }
 
-void FPGAReader::buildIndexes() {
-    net_map.clear();
-    inst_map.clear();
+void FPGAReader::updateSortedGains(const std::string& moved_name) {
+    const auto& moved_point = points[moved_name];
 
-    for (size_t i = 0; i < points.size(); ++i) {
-        inst_map[points[i].name] = i;
-        for (const auto& net : points[i].nets) {
-            net_map[net].push_back(i);
+    std::unordered_set<std::string > affected_points;
+    affected_points.reserve(500);
+    for (const std::string& net_name : moved_point.nets) {
+        net_cache.erase(net_name);
+
+        if (auto net_it = net_map.find(net_name); net_it != net_map.end()) {
+            for (const std::string& point_name : net_it->second) {
+                if (point_name != moved_name && !points[point_name].is_fixed) {
+                    affected_points.insert(point_name);
+                }
+            }
         }
     }
+
+    for (const std::string& point_name : affected_points) {
+        // 移除旧增益
+        int old_gain = cached_gains[point_name];
+        auto& range = gain_map[old_gain];
+        if (range.contains(point_name)) {
+            range.erase(point_name);
+            break;
+        }
+        int new_gain = Point_Gain(point_name);
+        cached_gains[point_name] = new_gain;
+        auto& new_gain_range = gain_map[new_gain];
+        new_gain_range.insert(point_name);
+    }
+    cached_gains.erase(moved_name);
+}
+
+std::array<int, 2> FPGAReader::NetStats(const std::string& net_id) const {
+    if (auto it = net_cache.find(net_id); it != net_cache.end()) {
+        return it->second;
+    }
+
+    std::array<int, 2> stats = {0, 0};
+    if (auto net_it = net_map.find(net_id); net_it != net_map.end()) {
+        for (const std::string& point_name : net_it->second) {
+            if (auto point_it = points.find(point_name); point_it != points.end()) {
+                int die = point_it->second.die;
+                if (die >= 0 && die <= 1) {
+                    stats[die]++;
+                }
+            }
+        }
+    }
+
+    net_cache[net_id] = stats;
+    return stats;
+}
+
+int FPGAReader::Point_Gain(const std::string& point_name) const {
+    auto point_it = points.find(point_name);
+    if (point_it == points.end()) return 0;
+
+    const Point& point = point_it->second;
+    int gain = 0;
+    int current_die = point.die;
+    int other_die = 1 - current_die;
+
+    for (const std::string& net_name : point.nets) {
+        auto stats = NetStats(net_name);
+        bool before_cut = (stats[0] > 0) && (stats[1] > 0);
+
+        stats[current_die]--;
+        stats[other_die]++;
+        bool after_cut = (stats[0] > 0) && (stats[1] > 0);
+
+        if (before_cut && !after_cut) {
+            gain += 1;  // 消除割边
+        } else if (!before_cut && after_cut) {
+            gain -= 1;  // 增加割边
+        }
+    }
+    return gain;
 }
 
 void FPGAReader::print_Info() const {
-    int die0_count = 0, die1_count = 0, fixed_count = 0;
-    for (const auto& p : points) {
-        if (p.is_fixed) fixed_count++;
-        if (p.die == 0) die0_count++;
-        else die1_count++;
-    }
     for (int die = 0; die < 2; ++die) {
         std::string fname = "..\\die" + std::to_string(die) + ".txt";
         std::ofstream ofs(fname);
@@ -103,239 +291,8 @@ void FPGAReader::print_Info() const {
             return;
         }
         for (const auto& p : points) {
-            if (p.die != die) continue;
-            ofs << p.name << "\n";
+            if (p.second.die != die) continue;
+            ofs << p.second.name << "\n";
         }
     }
-}
-
-void FPGAReader::FM() {
-    int movable_total = 0;
-    for (const auto& p : points)
-        if (!p.is_fixed)
-            ++movable_total;
-    if (movable_total == 0) {
-        return;
-    }
-
-    initial_Gain();
-    int initial_cost = calculateCutSize();
-    int iteration = 0;
-    const int MAX_ITERATIONS = 100;
-    const int MIN_IMPROVEMENT = 1;
-    int best_overall_cost = initial_cost;
-    std::vector<int> best_assignment(points.size());
-
-    for (size_t i = 0; i < points.size(); ++i) {
-        best_assignment[i] = points[i].die;
-    }
-
-    while (iteration < MAX_ITERATIONS) {
-        iteration++;
-
-        const size_t n = points.size();
-        std::vector<char> locked(n, 0);
-        std::vector<int>  orig_die(n);
-
-        struct Move {
-            size_t idx;
-            int from;
-            int to;
-            int gain;
-        };
-        std::vector<Move> moves;
-        moves.reserve(movable_total);
-
-        for (size_t i = 0; i < n; ++i)
-            orig_die[i] = points[i].die;
-
-        auto rollback = [&](int inclusive) {
-            for (auto t = static_cast<size_t>(inclusive + 1); t < moves.size(); ++t) {
-                const auto& mv = moves[t];
-                points[mv.idx].die = mv.from;
-            }
-            updateAllGains();
-        };
-
-        int moves_made = 0;
-        while (moves_made < movable_total) {
-            int best_gain = INT_MIN;
-            size_t best_idx = SIZE_MAX;
-            int best_from = -1, best_to = -1;
-
-            for (size_t i = 0; i < n; ++i) {
-                if (locked[i]) continue;
-                const auto& p = points[i];
-                if (p.is_fixed) continue;
-
-                int g = cached_gains[i];
-                if (g > best_gain) {
-                    best_gain = g;
-                    best_idx = i;
-                    best_from = p.die;
-                    best_to   = 1 - p.die;
-                }
-            }
-
-            if (best_idx == SIZE_MAX) {
-                break;
-            }
-
-            locked[best_idx] = 1;
-            points[best_idx].die = best_to;
-            moves.push_back({best_idx, best_from, best_to, best_gain});
-            updateGain(best_idx);
-            moves_made++;
-        }
-
-        if (moves.empty()) {
-            break;
-        }
-
-        int cum = 0, best_cum = INT_MIN, best_k = -1;
-        for (size_t k = 0; k < moves.size(); ++k) {
-            cum += moves[k].gain;
-            if (cum > best_cum) {
-                best_cum = cum;
-                best_k = static_cast<int>(k);
-            }
-        }
-
-        if (best_k >= 0 && best_cum > MIN_IMPROVEMENT) {
-            rollback(best_k);
-            int current_cost = calculateCutSize();
-
-            if (current_cost < best_overall_cost) {
-                best_overall_cost = current_cost;
-                for (size_t i = 0; i < points.size(); ++i) {
-                    best_assignment[i] = points[i].die;
-                }
-            }
-            std::cout << std::endl;
-        } else {
-            // 回退所有移动
-            for (const auto& mv : moves) {
-                points[mv.idx].die = mv.from;
-            }
-            updateAllGains();
-            break;
-        }
-    }
-
-    for (size_t i = 0; i < points.size(); ++i) {
-        points[i].die = best_assignment[i];
-    }
-}
-
-void FPGAReader::initial_Gain() {
-    const size_t n = points.size();
-    net_cache.clear();
-    cached_gains.clear();
-    cached_gains.resize(n);
-
-    for (const auto& kv : net_map) {
-        net_cache[kv.first] = NetStats(kv.first);
-    }
-    for (size_t i = 0; i < n; ++i) {
-        cached_gains[i] = Point_Gain(i);
-    }
-    gains_initialized = true;
-}
-
-std::array<int, 2> FPGAReader::NetStats(const std::string& net_id) const {
-    auto it = net_map.find(net_id);
-    if (it == net_map.end()) {
-        return {0, 0};
-    }
-
-    std::array<int, 2> counts = {0, 0};
-    for (size_t point_idx : it->second) {
-        int die = points[point_idx].die;
-        if (die == 0 || die == 1)
-            ++counts[die];
-    }
-    return counts;
-}
-
-int FPGAReader::Point_Gain(size_t point_idx) const {
-    const Point& p = points[point_idx];
-    if (p.is_fixed)
-        return INT_MIN / 4;
-
-    int gain = 0;
-    const int current_die = p.die;
-    const int target_die = 1 - current_die;
-
-    for (const auto& net_id : p.nets) {
-        std::array<int, 2> counts;
-        auto cache_it = net_cache.find(net_id);
-        if (cache_it != net_cache.end()) {
-            counts = cache_it->second;
-        } else {
-            counts = NetStats(net_id);
-        }
-
-        int before_cut = (counts[0] > 0 && counts[1] > 0) ? 1 : 0;
-        std::array<int, 2> after_counts = counts;
-        after_counts[current_die]--;
-        after_counts[target_die]++;
-
-        int after_cut = (after_counts[0] > 0 && after_counts[1] > 0) ? 1 : 0;
-        gain += (before_cut - after_cut);
-    }
-    return gain;
-}
-
-void FPGAReader::updateGain(size_t moved_idx) {
-    if (!gains_initialized) {
-        initial_Gain();
-        return;
-    }
-
-    const Point& moved_point = points[moved_idx];
-    std::unordered_set<size_t> affected_points;
-    affected_points.insert(moved_idx);
-
-    for (const auto& net_id : moved_point.nets) {
-        net_cache[net_id] = NetStats(net_id);
-        auto it = net_map.find(net_id);
-        if (it != net_map.end()) {
-            for (size_t idx : it->second) {
-                affected_points.insert(idx);
-            }
-        }
-    }
-    for (size_t idx : affected_points) {
-        cached_gains[idx] = Point_Gain(idx);
-    }
-}
-
-void FPGAReader::updateAllGains() const {
-    for (auto& kv : net_cache) {
-        kv.second = NetStats(kv.first);
-    }
-    for (size_t i = 0; i < points.size(); ++i) {
-        cached_gains[i] = Point_Gain(i);
-    }
-}
-
-int FPGAReader::calculateCutSize() const {
-    int cut_size = 0;
-    for (const auto& kv : net_map) {
-        const auto& net_points = kv.second;
-        if (net_points.size() < 2)
-            continue;
-
-        bool has_die0 = false, has_die1 = false;
-        for (size_t idx : net_points) {
-            if (points[idx].die == 0) has_die0 = true;
-            else if (points[idx].die == 1) has_die1 = true;
-
-            if (has_die0 && has_die1) {
-                cut_size++;
-                break;
-            }
-        }
-    }
-    return cut_size;
 }
