@@ -61,6 +61,11 @@ private:
     std::string max_gain_point_name;
     mutable std::unordered_map<std::string, std::array<int, 2>> net_cache;
 
+    void updateGainQueue();
+    int iteration_counter = 0;
+    const int UPDATE_FREQUENCY = 100; // 或其他合适的值
+
+    std::priority_queue<std::pair<int, std::string>> gain_queue;
 
     void initSortedGains();
     void updateSortedGains(const std::string& moved_name);

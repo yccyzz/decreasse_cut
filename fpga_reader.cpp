@@ -16,7 +16,15 @@ bool FPGAReader::readPlaceFile(const std::string& file_name) {
         if (line.empty()) continue;
         Point p;
         if (parsePlacement(line, p)) {
-            p.die = (p.y < 120) ? 0 : 1;
+            if (p.y < 120) {
+                p.die = 0;
+            }else if(p.y < 240) {
+                p.die = 1;
+            }else if(p.y < 360) {
+                p.die = 2;
+            }else {
+                p.die = 3;
+            }
             points.insert({p.name, std::move(p)});
         }
     }
@@ -144,10 +152,6 @@ void FPGAReader::FM() {
     std::cout << "CutSize time: " << std::chrono::duration<double>(cutsize_end - cutsize_start).count() << std::endl;
     std::cout << "Initial cut size: " << initial_cut_size << std::endl;
 
-    // 重置所有点状态
-//    for (auto& [name, point] : points) {
-//        point.is_fixed = false;
-//    }
     auto init_gain_start = std::chrono::high_resolution_clock::now();
     // 初始化排序的增益表
     initSortedGains();
@@ -156,28 +160,80 @@ void FPGAReader::FM() {
 
 
     // FM Pass - 严格只移动正增益点
-    while (!gain_map.empty() && max_gain > 0) {
-        // 获取最大增益的点（严格 > 0）
-        // 从排序表中移除
-        gain_map[max_gain].erase(max_gain_point_name);
-        max_gain = -INT32_MAX;
-        // 执行移动
-        points[max_gain_point_name].die = 1 - points[max_gain_point_name].die;
-        points[max_gain_point_name].is_fixed = true;
+    while (!gain_map.empty() ) {
 
-        auto update_gain_start = std::chrono::high_resolution_clock::now();
-        updateSortedGains(max_gain_point_name);
-        max_gain = -INT32_MAX;
-        for (const auto& gain : gain_map) {
-            if (gain.second.empty()) {
-                continue;
-            }
-            if (gain.first > max_gain) {
-                max_gain = gain.first;
-                max_gain_point_name = *gain.second.begin();
+        if (gain_queue.empty()) {
+            updateGainQueue();
+            if (gain_queue.empty()) {
+                break; // 没有更多可移动的点
             }
         }
-        auto update_gain_end = std::chrono::high_resolution_clock::now();
+
+        auto top_item = gain_queue.top();
+        gain_queue.pop();
+
+        std::string current_max_point_name = top_item.second;
+        int current_max_gain = Point_Gain(current_max_point_name);
+
+        // 检查是否为正增益，如果不是则退出
+        if (current_max_gain < 0) {
+            break;
+        }
+
+        // 检查该点是否已被固定（可能在队列更新间隔内被处理过）
+        if (points[current_max_point_name].is_fixed) {
+            continue;
+        }
+
+        // 验证该点在gain_map中仍然存在（确保数据一致性）
+        if (gain_map[current_max_gain].find(current_max_point_name) == gain_map[current_max_gain].end()) {
+            continue; // 该点可能已经被更新，跳过
+        }
+
+        // 从gain_map中移除该点
+        gain_map[current_max_gain].erase(current_max_point_name);
+
+
+        // 执行移动
+        points[current_max_point_name].die = 1 - points[current_max_point_name].die;
+        points[current_max_point_name].is_fixed = true;
+
+
+        // 更新受影响点的增益（这会更新gain_map）
+        updateSortedGains(current_max_point_name);
+
+        // 定期更新队列以保持gain_queue和gain_map同步
+        iteration_counter++;
+        if (iteration_counter >= UPDATE_FREQUENCY) {
+            updateGainQueue();
+            iteration_counter = 0;
+        }
+
+
+        // 更新成员变量（用于其他函数可能的访问）
+//        max_gain = current_max_gain;
+//        max_gain_point_name = current_max_point_name;
+
+//        // 获取最大增益的点（严格 > 0）
+//        gain_map[max_gain].erase(max_gain_point_name);
+//        max_gain = -INT32_MAX;
+//        // 执行移动
+//        points[max_gain_point_name].die = 1 - points[max_gain_point_name].die;
+//        points[max_gain_point_name].is_fixed = true;
+
+
+//        auto update_gain_start = std::chrono::high_resolution_clock::now();
+//        max_gain = -INT32_MAX;
+//        for (const auto& gain : gain_map) {
+//            if (gain.second.empty()) {
+//                continue;
+//            }
+//            if (gain.first > max_gain) {
+//                max_gain = gain.first;
+//                max_gain_point_name = *gain.second.begin();
+//            }
+//        }
+//        auto update_gain_end = std::chrono::high_resolution_clock::now();
 //        std::cout << "Update gain time: " << std::chrono::duration<double>(update_gain_end - update_gain_start).count() << std::endl;
     }
 
@@ -293,6 +349,26 @@ void FPGAReader::print_Info() const {
         for (const auto& p : points) {
             if (p.second.die != die) continue;
             ofs << p.second.name << "\n";
+        }
+    }
+}
+
+
+void FPGAReader::updateGainQueue() {
+    // 清空现有队列
+    std::priority_queue<std::pair<int, std::string>> empty_queue;
+    std::swap(gain_queue, empty_queue);
+
+    // 用当前增益值填充队列，按gain值从高到低排序
+    for (const auto& [gain_value, point_set] : gain_map) {
+        if (point_set.empty()) {
+            continue;
+        }
+        for (const auto& point_name : point_set) {
+            // 确保只添加未固定的点
+            if (!points[point_name].is_fixed) {
+                gain_queue.push(std::make_pair(gain_value, point_name));
+            }
         }
     }
 }
