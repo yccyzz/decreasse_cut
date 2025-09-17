@@ -28,8 +28,24 @@ bool FPGAReader::readPlaceFile(const std::string& file_name) {
             points.insert({p.name, std::move(p)});
         }
     }
-
+    detectDieMode();
     return true;
+}
+
+void FPGAReader::detectDieMode() {
+    std::set<int> dies_used;
+    for (const auto& [name, point] : points) {
+        dies_used.insert(point.die);
+    }
+
+    // 如果只使用了die 0和1，则为2-die模式；否则为4-die模式
+    if (dies_used.size() == 2 && dies_used.count(0) && dies_used.count(1)) {
+        num_dies = 2;
+        std::cout << "Detected 2-die mode" << std::endl;
+    } else {
+        num_dies = 4;
+        std::cout << "Detected 4-die mode "<<std::endl;
+    }
 }
 
 void FPGAReader::clear() {
@@ -37,6 +53,9 @@ void FPGAReader::clear() {
     net_map.clear();
     net_cache.clear();
     cached_gains.clear();
+    num_dies = 2; // 默认2-die模式
+    max_gain = -INT32_MAX;
+    iteration_counter = 0;
 }
 
 bool FPGAReader::readNetFile(std::string& file_name) {
@@ -68,7 +87,7 @@ bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
 void FPGAReader::parseNet(std::string& content) {
     std::replace(content.begin(), content.end(), '\n', ' ');
     std::regex inst_re(R"([\w]+\s+([\w.]+)\s*\((.*?)\);)", std::regex::icase);
-    std::regex net_re(R"(\.\w+\(([\w.]+)\))");
+    std::regex net_re(R"(\.\w+\((net_\d+)\))");
 
     // 使用string来临时存储，然后转为string
     std::unordered_map<std::string, std::vector<std::string>> temp_point_nets;
@@ -117,28 +136,27 @@ void FPGAReader::parseNet(std::string& content) {
         }
     }
 
-    std::cout << "Parsed " << net_map.size() << " nets connecting " << points.size() << " points" << std::endl;
+//    std::cout << "Parsed " << net_map.size() << " nets connecting " << points.size() << " points" << std::endl;
 }
 
 int FPGAReader::calculateCutSize() const {
     int cut_size = 0;
 
+
     // 遍历所有网络，统计跨分区的网络数量
     for (const auto& [net_name, point_set] : net_map) {
-        bool has_die0 = false, has_die1 = false;
+        std::set<int> dies_in_net;
 
-        // 检查网络中的点分布在哪些分区
+        // 收集网络中所有点所在的die
         for (const std::string& point_name : point_set) {
             if (auto it = points.find(point_name); it != points.end()) {
-                if (it->second.die == 0) has_die0 = true;
-                else if (it->second.die == 1) has_die1 = true;
-
-                // 如果同时存在于两个分区，这是一个割边
-                if (has_die0 && has_die1) {
-                    cut_size++;
-                    break;
-                }
+                dies_in_net.insert(it->second.die);
             }
+        }
+
+        // 如果网络跨越多个die，则算作cut
+        if (dies_in_net.size() > 1) {
+            cut_size++;
         }
     }
     return cut_size;
@@ -149,14 +167,14 @@ void FPGAReader::FM() {
     auto cutsize_start = std::chrono::high_resolution_clock::now();
     int initial_cut_size = calculateCutSize();
     auto cutsize_end = std::chrono::high_resolution_clock::now();
-    std::cout << "CutSize time: " << std::chrono::duration<double>(cutsize_end - cutsize_start).count() << std::endl;
+//    std::cout << "CutSize time: " << std::chrono::duration<double>(cutsize_end - cutsize_start).count() << std::endl;
     std::cout << "Initial cut size: " << initial_cut_size << std::endl;
 
     auto init_gain_start = std::chrono::high_resolution_clock::now();
     // 初始化排序的增益表
     initSortedGains();
     auto init_gain_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Init gain time: " << std::chrono::duration<double>(init_gain_end - init_gain_start).count() << std::endl;
+//    std::cout << "Init gain time: " << std::chrono::duration<double>(init_gain_end - init_gain_start).count() << std::endl;
 
 
     // FM Pass - 严格只移动正增益点
@@ -238,7 +256,7 @@ void FPGAReader::FM() {
     }
 
     std::cout << "Final cut size: " << calculateCutSize() << std::endl;
-    std::cout << "Improvement: " << (initial_cut_size - calculateCutSize()) << std::endl;
+//    std::cout << "Improvement: " << (initial_cut_size - calculateCutSize()) << std::endl;
 }
 
 void FPGAReader::initSortedGains() {
@@ -282,9 +300,9 @@ void FPGAReader::updateSortedGains(const std::string& moved_name) {
         auto& range = gain_map[old_gain];
         if (range.contains(point_name)) {
             range.erase(point_name);
-            break;
         }
-        int new_gain = Point_Gain(point_name);
+
+        auto [new_gain, target_die] = Point_Gain_Multi(point_name);
         cached_gains[point_name] = new_gain;
         auto& new_gain_range = gain_map[new_gain];
         new_gain_range.insert(point_name);
@@ -292,17 +310,17 @@ void FPGAReader::updateSortedGains(const std::string& moved_name) {
     cached_gains.erase(moved_name);
 }
 
-std::array<int, 2> FPGAReader::NetStats(const std::string& net_id) const {
+std::vector<int> FPGAReader::NetStats(const std::string& net_id) const {
     if (auto it = net_cache.find(net_id); it != net_cache.end()) {
         return it->second;
     }
 
-    std::array<int, 2> stats = {0, 0};
+    std::vector<int> stats(num_dies, 0);
     if (auto net_it = net_map.find(net_id); net_it != net_map.end()) {
         for (const std::string& point_name : net_it->second) {
             if (auto point_it = points.find(point_name); point_it != points.end()) {
                 int die = point_it->second.die;
-                if (die >= 0 && die <= 1) {
+                if (die >= 0 && die < num_dies) {
                     stats[die]++;
                 }
             }
@@ -314,33 +332,45 @@ std::array<int, 2> FPGAReader::NetStats(const std::string& net_id) const {
 }
 
 int FPGAReader::Point_Gain(const std::string& point_name) const {
-    auto point_it = points.find(point_name);
-    if (point_it == points.end()) return 0;
-
-    const Point& point = point_it->second;
-    int gain = 0;
-    int current_die = point.die;
-    int other_die = 1 - current_die;
-
-    for (const std::string& net_name : point.nets) {
-        auto stats = NetStats(net_name);
-        bool before_cut = (stats[0] > 0) && (stats[1] > 0);
-
-        stats[current_die]--;
-        stats[other_die]++;
-        bool after_cut = (stats[0] > 0) && (stats[1] > 0);
-
-        if (before_cut && !after_cut) {
-            gain += 1;  // 消除割边
-        } else if (!before_cut && after_cut) {
-            gain -= 1;  // 增加割边
-        }
-    }
+    // 2-die模式的原始实现，保持向后兼容
+    auto [gain, target_die] = Point_Gain_Multi(point_name);
     return gain;
 }
 
+std::pair<int, int> FPGAReader::Point_Gain_Multi(const std::string& point_name) const {
+    auto point_it = points.find(point_name);
+    if (point_it == points.end()) return {0, -1};
+
+    const Point& point = point_it->second;
+    int current_die = point.die;
+    int best_gain = -INT_MAX;
+    int best_target_die = current_die;
+
+    // 如果是2-die模式，只考虑另一个die
+    if (num_dies == 2) {
+        int target_die = 1 - current_die;
+        int gain = calculateGainForMove(point_name, current_die, target_die);
+        return {gain, target_die};
+    }
+
+    // 4-die模式：尝试移动到所有其他die，选择gain最大的
+    for (int target_die = 0; target_die < num_dies; ++target_die) {
+        if (target_die == current_die) continue;
+
+        int gain = calculateGainForMove(point_name, current_die, target_die);
+        if (gain > best_gain) {
+            best_gain = gain;
+            best_target_die = target_die;
+        }
+    }
+
+    return {best_gain, best_target_die};
+}
+
 void FPGAReader::print_Info() const {
-    for (int die = 0; die < 2; ++die) {
+    int output_dies = (num_dies == 2) ? 2 : 4;
+
+    for (int die = 0; die < output_dies; ++die) {
         std::string fname = "..\\die" + std::to_string(die) + ".txt";
         std::ofstream ofs(fname);
         if (!ofs) {
@@ -353,6 +383,43 @@ void FPGAReader::print_Info() const {
     }
 }
 
+int FPGAReader::calculateGainForMove(const std::string& point_name, int from_die, int to_die) const {
+    auto point_it = points.find(point_name);
+    if (point_it == points.end()) return 0;
+
+    const Point& point = point_it->second;
+    int gain = 0;
+
+    for (const std::string& net_name : point.nets) {
+        auto stats = NetStats(net_name);
+
+        // 计算移动前该网络是否跨die
+        int dies_before = 0;
+        for (int i = 0; i < num_dies; ++i) {
+            if (stats[i] > 0) dies_before++;
+        }
+        bool before_cut = dies_before > 1;
+
+        // 模拟移动后的情况
+        stats[from_die]--;
+        stats[to_die]++;
+
+        // 计算移动后该网络是否跨die
+        int dies_after = 0;
+        for (int i = 0; i < num_dies; ++i) {
+            if (stats[i] > 0) dies_after++;
+        }
+        bool after_cut = dies_after > 1;
+
+        if (before_cut && !after_cut) {
+            gain += 1;  // 消除割边
+        } else if (!before_cut && after_cut) {
+            gain -= 1;  // 增加割边
+        }
+    }
+
+    return gain;
+}
 
 void FPGAReader::updateGainQueue() {
     // 清空现有队列
