@@ -53,9 +53,12 @@ void FPGAReader::clear() {
     net_map.clear();
     net_cache.clear();
     cached_gains.clear();
+    sll_cache.clear();
     num_dies = 2; // 默认2-die模式
     max_gain = -INT32_MAX;
     iteration_counter = 0;
+    cached_cut_size = -1;
+    network_stats_cache_valid = false;
 }
 
 bool FPGAReader::readNetFile(std::string& file_name) {
@@ -106,7 +109,7 @@ void FPGAReader::parseNet(std::string& content) {
         }
 
         for (auto net_it = std::sregex_iterator(conn.begin(), conn.end(), net_re);
-            net_it != std::sregex_iterator(); ++net_it) {
+             net_it != std::sregex_iterator(); ++net_it) {
             std::string net_name = (*net_it)[1].str();
             temp_point_nets[inst_name].emplace_back(net_name);
             temp_net_to_points[net_name].insert(inst_name);
@@ -136,48 +139,158 @@ void FPGAReader::parseNet(std::string& content) {
         }
     }
 
-//    std::cout << "Parsed " << net_map.size() << " nets connecting " << points.size() << " points" << std::endl;
+    // 解析完成后，使网络统计缓存失效
+    invalidateNetworkStatsCache();
 }
 
-int FPGAReader::calculateCutSize() const {
-    int cut_size = 0;
+// ==================== 优化的网络统计计算 ====================
 
+void FPGAReader::updateNetworkStatsCache() const {
+    if (network_stats_cache_valid) return;
 
-    // 遍历所有网络，统计跨分区的网络数量
+    sll_cache.clear();
+    cached_cut_size = 0;
+
+    // 初始化所有die对的SLL为0
+    for (int i = 0; i < num_dies; ++i) {
+        for (int j = i + 1; j < num_dies; ++j) {
+            sll_cache[{i, j}] = 0;
+        }
+    }
+
+    // 一次遍历计算cut size和所有SLL
     for (const auto& [net_name, point_set] : net_map) {
         std::set<int> dies_in_net;
 
-        // 收集网络中所有点所在的die
+        // 收集该网络涉及的所有die
         for (const std::string& point_name : point_set) {
             if (auto it = points.find(point_name); it != points.end()) {
                 dies_in_net.insert(it->second.die);
             }
         }
 
-        // 如果网络跨越多个die，则算作cut
+        // 如果网络跨越多个die
         if (dies_in_net.size() > 1) {
-            cut_size++;
+            cached_cut_size++;  // cut size +1
+
+            // 更新所有相关die对的SLL
+            for (auto it1 = dies_in_net.begin(); it1 != dies_in_net.end(); ++it1) {
+                for (auto it2 = std::next(it1); it2 != dies_in_net.end(); ++it2) {
+                    int die1 = *it1, die2 = *it2;
+                    if (die1 > die2) std::swap(die1, die2);
+                    sll_cache[{die1, die2}]++;
+                }
+            }
         }
     }
-    return cut_size;
+
+    network_stats_cache_valid = true;
 }
+
+void FPGAReader::invalidateNetworkStatsCache() {
+    network_stats_cache_valid = false;
+    net_cache.clear(); // 同时清空网络缓存
+}
+
+int FPGAReader::calculateCutSize() const {
+    updateNetworkStatsCache();
+    return cached_cut_size;
+}
+
+int FPGAReader::calculateSLLBetweenDies(int die1, int die2) const {
+    if (die1 == die2) return 0;
+
+    // 确保die1 < die2，标准化键值
+    if (die1 > die2) std::swap(die1, die2);
+
+    updateNetworkStatsCache();
+
+    auto it = sll_cache.find({die1, die2});
+    return (it != sll_cache.end()) ? it->second : 0;
+}
+
+// ==================== SLL约束检查 ====================
+
+int FPGAReader::calculateSLLChangeForDiePair(const std::string& point_name, int from_die, int to_die, int die1, int die2) const {
+    auto point_it = points.find(point_name);
+    if (point_it == points.end()) return 0;
+
+    const Point& point = point_it->second;
+    int sll_change = 0;
+
+    // 遍历该点连接的所有网络
+    for (const std::string& net_name : point.nets) {
+        auto stats = NetStats(net_name);
+
+        // 计算移动前该网络是否连接die1和die2
+        bool before_connects_die1 = (stats[die1] > 0);
+        bool before_connects_die2 = (stats[die2] > 0);
+        bool before_sll = before_connects_die1 && before_connects_die2;
+
+        // 模拟移动后的状态
+        stats[from_die]--;
+        stats[to_die]++;
+
+        // 计算移动后该网络是否连接die1和die2
+        bool after_connects_die1 = (stats[die1] > 0);
+        bool after_connects_die2 = (stats[die2] > 0);
+        bool after_sll = after_connects_die1 && after_connects_die2;
+
+        // 计算SLL变化
+        if (!before_sll && after_sll) {
+            sll_change += 1;  // 新增一个SLL
+        } else if (before_sll && !after_sll) {
+            sll_change -= 1;  // 减少一个SLL
+        }
+        // 其他情况SLL不变
+    }
+
+    return sll_change;
+}
+
+bool FPGAReader::isValidMoveForSLL(const std::string& point_name, int from_die, int to_die) const {
+    if (from_die == to_die) return true;
+
+    // 对于2-die模式，只需要检查die0和die1之间
+    if (num_dies == 2) {
+        int current_sll = calculateSLLBetweenDies(0, 1);
+        int sll_change = calculateSLLChangeForDiePair(point_name, from_die, to_die, 0, 1);
+        return (current_sll + sll_change <= MAX_SLL_BETWEEN_DIES);
+    }
+
+    // 对于4-die模式，检查所有die对
+    for (int i = 0; i < num_dies; ++i) {
+        for (int j = i + 1; j < num_dies; ++j) {
+            int current_sll = calculateSLLBetweenDies(i, j);
+            int sll_change = calculateSLLChangeForDiePair(point_name, from_die, to_die, i, j);
+
+            if (current_sll + sll_change > MAX_SLL_BETWEEN_DIES) {
+                return false;  // 违反约束
+            }
+        }
+    }
+
+    return true;
+}
+
+// ==================== FM算法实现 ====================
 
 void FPGAReader::FM() {
     if (points.empty()) return;
     auto cutsize_start = std::chrono::high_resolution_clock::now();
     int initial_cut_size = calculateCutSize();
     auto cutsize_end = std::chrono::high_resolution_clock::now();
-//    std::cout << "CutSize time: " << std::chrono::duration<double>(cutsize_end - cutsize_start).count() << std::endl;
     std::cout << "Initial cut size: " << initial_cut_size << std::endl;
+
+    // 打印初始SLL统计
+//    printSLLStats();
 
     auto init_gain_start = std::chrono::high_resolution_clock::now();
     // 初始化排序的增益表
     initSortedGains();
     auto init_gain_end = std::chrono::high_resolution_clock::now();
-//    std::cout << "Init gain time: " << std::chrono::duration<double>(init_gain_end - init_gain_start).count() << std::endl;
 
-
-    // FM Pass - 严格只移动正增益点
+    // FM Pass - 严格只移动正增益点，并检查SLL约束
     while (!gain_map.empty() ) {
 
         if (gain_queue.empty()) {
@@ -193,11 +306,6 @@ void FPGAReader::FM() {
         std::string current_max_point_name = top_item.second;
         int current_max_gain = Point_Gain(current_max_point_name);
 
-        // 检查是否为正增益，如果不是则退出
-        if (current_max_gain < 0) {
-            break;
-        }
-
         // 检查该点是否已被固定（可能在队列更新间隔内被处理过）
         if (points[current_max_point_name].is_fixed) {
             continue;
@@ -208,14 +316,40 @@ void FPGAReader::FM() {
             continue; // 该点可能已经被更新，跳过
         }
 
+        // 确定目标die
+        int target_die;
+        if (num_dies == 2) {
+            target_die = 1 - points[current_max_point_name].die;
+        } else {
+            // 4-die模式：获取最佳目标die
+            auto [gain, best_target] = Point_Gain_Multi(current_max_point_name);
+            target_die = best_target;
+            // 重新验证gain值
+            current_max_gain = gain;
+        }
+
+        // **新增：SLL约束检查**
+        if (!isValidMoveForSLL(current_max_point_name,
+                               points[current_max_point_name].die,
+                               target_die)) {
+            // 违反SLL约束，标记为固定，不允许移动
+            points[current_max_point_name].is_fixed = true;
+            // 从gain_map中移除该点
+            gain_map[current_max_gain].erase(current_max_point_name);
+            continue;
+        }
+
+        // 检查是否为正增益，如果不是则退出
+        if (current_max_gain < 0) {
+            break;
+        }
+
         // 从gain_map中移除该点
         gain_map[current_max_gain].erase(current_max_point_name);
 
-
         // 执行移动
-        points[current_max_point_name].die = 1 - points[current_max_point_name].die;
+        points[current_max_point_name].die = target_die;
         points[current_max_point_name].is_fixed = true;
-
 
         // 更新受影响点的增益（这会更新gain_map）
         updateSortedGains(current_max_point_name);
@@ -226,37 +360,11 @@ void FPGAReader::FM() {
             updateGainQueue();
             iteration_counter = 0;
         }
-
-
-        // 更新成员变量（用于其他函数可能的访问）
-//        max_gain = current_max_gain;
-//        max_gain_point_name = current_max_point_name;
-
-//        // 获取最大增益的点（严格 > 0）
-//        gain_map[max_gain].erase(max_gain_point_name);
-//        max_gain = -INT32_MAX;
-//        // 执行移动
-//        points[max_gain_point_name].die = 1 - points[max_gain_point_name].die;
-//        points[max_gain_point_name].is_fixed = true;
-
-
-//        auto update_gain_start = std::chrono::high_resolution_clock::now();
-//        max_gain = -INT32_MAX;
-//        for (const auto& gain : gain_map) {
-//            if (gain.second.empty()) {
-//                continue;
-//            }
-//            if (gain.first > max_gain) {
-//                max_gain = gain.first;
-//                max_gain_point_name = *gain.second.begin();
-//            }
-//        }
-//        auto update_gain_end = std::chrono::high_resolution_clock::now();
-//        std::cout << "Update gain time: " << std::chrono::duration<double>(update_gain_end - update_gain_start).count() << std::endl;
     }
 
     std::cout << "Final cut size: " << calculateCutSize() << std::endl;
-//    std::cout << "Improvement: " << (initial_cut_size - calculateCutSize()) << std::endl;
+    // 打印最终SLL统计
+//    printSLLStats();
 }
 
 void FPGAReader::initSortedGains() {
@@ -308,6 +416,9 @@ void FPGAReader::updateSortedGains(const std::string& moved_name) {
         new_gain_range.insert(point_name);
     }
     cached_gains.erase(moved_name);
+
+    // 移动后使网络统计缓存失效
+    invalidateNetworkStatsCache();
 }
 
 std::vector<int> FPGAReader::NetStats(const std::string& net_id) const {
@@ -367,22 +478,6 @@ std::pair<int, int> FPGAReader::Point_Gain_Multi(const std::string& point_name) 
     return {best_gain, best_target_die};
 }
 
-void FPGAReader::print_Info() const {
-    int output_dies = (num_dies == 2) ? 2 : 4;
-
-    for (int die = 0; die < output_dies; ++die) {
-        std::string fname = "..\\die" + std::to_string(die) + ".txt";
-        std::ofstream ofs(fname);
-        if (!ofs) {
-            return;
-        }
-        for (const auto& p : points) {
-            if (p.second.die != die) continue;
-            ofs << p.second.name << "\n";
-        }
-    }
-}
-
 int FPGAReader::calculateGainForMove(const std::string& point_name, int from_die, int to_die) const {
     auto point_it = points.find(point_name);
     if (point_it == points.end()) return 0;
@@ -438,4 +533,52 @@ void FPGAReader::updateGainQueue() {
             }
         }
     }
+}
+
+// ==================== 输出和调试函数 ====================
+
+void FPGAReader::print_Info() const {
+    int output_dies = (num_dies == 2) ? 2 : 4;
+
+    for (int die = 0; die < output_dies; ++die) {
+        std::string fname = "..\\die" + std::to_string(die) + ".txt";
+        std::ofstream ofs(fname);
+        if (!ofs) {
+            return;
+        }
+        for (const auto& p : points) {
+            if (p.second.die != die) continue;
+            ofs << p.second.name << "\n";
+        }
+    }
+}
+
+void FPGAReader::printSLLStats() const {
+    std::cout << "\n=== SLL Statistics ===" << std::endl;
+
+    if (num_dies == 2) {
+        int sll = calculateSLLBetweenDies(0, 1);
+        std::cout << "Die 0 <-> Die 1: " << sll << " SLLs";
+        if (sll > MAX_SLL_BETWEEN_DIES) {
+            std::cout << " (VIOLATION! Limit: " << MAX_SLL_BETWEEN_DIES << ")";
+        } else {
+            std::cout << " (OK, Limit: " << MAX_SLL_BETWEEN_DIES << ")";
+        }
+        std::cout << std::endl;
+    } else {
+        // 4-die模式
+        for (int i = 0; i < num_dies; ++i) {
+            for (int j = i + 1; j < num_dies; ++j) {
+                int sll = calculateSLLBetweenDies(i, j);
+                std::cout << "Die " << i << " <-> Die " << j << ": " << sll << " SLLs";
+                if (sll > MAX_SLL_BETWEEN_DIES) {
+                    std::cout << " (VIOLATION! Limit: " << MAX_SLL_BETWEEN_DIES << ")";
+                } else {
+                    std::cout << " (OK, Limit: " << MAX_SLL_BETWEEN_DIES << ")";
+                }
+                std::cout << std::endl;
+            }
+        }
+    }
+    std::cout << "=====================\n" << std::endl;
 }
