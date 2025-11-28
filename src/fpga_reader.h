@@ -22,6 +22,7 @@ struct Point {
     int y = 0;
     int die = 0;
     bool is_fixed = false;
+    bool is_originally_fixed = false; // 【新增】用于记录输入文件中的原始 FIXED 状态
     std::string type;  // 实例类型：RAMB36E2, RAMB18E2, DSP48E2 等
     std::vector<std::string> nets;
 };

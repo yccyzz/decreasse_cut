@@ -145,6 +145,7 @@ bool FPGAReader::readNetFile(std::string& file_name) {
     return true;
 }
 
+// fpga_reader.cpp
 bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
     std::istringstream ss(line);
     std::string name, x, z, last;
@@ -154,7 +155,12 @@ bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
     p.name = name;
     p.y = y;
     p.is_fixed = false;
-    if (ss >> last && last == "FIXED") p.is_fixed = true;
+    p.is_originally_fixed = false; // 【新增】初始化
+
+    if (ss >> last && last == "FIXED") {
+        p.is_fixed = true;
+        p.is_originally_fixed = true; // 【修改】记录原始 FIXED 状态
+    }
 
     return true;
 }
@@ -810,25 +816,43 @@ void FPGAReader::updateGainQueue() {
         }
     }
 }
+// fpga_reader.cpp
 
-// ==================== 输出函数 ====================
+// ==================== 输出函数 (已修改) ====================
 
+/**
+ * @brief 将当前的点位（Point）信息输出到一个新的布局文件（FPGA_FM_output.place）。
+ * 输出格式兼容 readPlaceFile，以便于被主程序继续读取运行。
+ * 格式: name x y z [FIXED]
+ * 仅当点在输入文件时就被标记为 FIXED 时，才输出 FIXED。
+ */
 void FPGAReader::print_Info() const {
-    int output_dies = (num_dies == 2) ? 2 : 4;
+    std::string output_file_name = "../FPGA_FM_output.place";
+    std::ofstream ofs(output_file_name);
 
-    for (int die = 0; die < output_dies; ++die) {
-        std::string fname = "..\\die" + std::to_string(die) + ".txt";
-        std::ofstream ofs(fname);
-        if (!ofs) {
-            return;
-        }
-        for (const auto& p : points) {
-            if (p.second.die != die) continue;
-            ofs << p.second.name << "\n";
-        }
+    if (!ofs) {
+        std::cerr << "ERROR: Cannot create output placement file: " << output_file_name << "\n";
+        return;
     }
-}
 
+    for (const auto& pair : points) {
+        const Point& p = pair.second;
+
+        // 格式: name x y z [FIXED]
+        // 假设 X=0, Z=0，使用 Point 结构体中存储的 Y 坐标
+        ofs << p.name << " 0 " << p.y << " 0";
+
+        // 【修改】仅当点在输入时就为 FIXED 时，才输出 FIXED
+        if (p.is_originally_fixed) {
+            ofs << " FIXED";
+        }
+
+        ofs << "\n";
+    }
+
+    std::cout << "Successfully saved FM output to: " << output_file_name << "\n";
+    std::cout << "This file can be re-read by FPGAReader::readPlaceFile.\n";
+}
 void FPGAReader::saveResultsToExcel(const std::string& excel_file) {
     bool file_exists = std::ifstream(excel_file).good();
 
