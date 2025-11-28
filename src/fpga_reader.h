@@ -40,6 +40,9 @@ public:
     // 基础文件读取
     bool readPlaceFile(const std::string& file_name);
     bool readNetFile(std::string& file_name);
+    // 新增：读取超节点文件
+    bool readCoarsenedFiles(const std::string& pl_file,
+                            const std::string& net_file);
 
     // FM算法
     void FM();
@@ -81,7 +84,7 @@ private:
     // 统计数据
     std::map<std::pair<int, int>, int> initial_pairwise_cuts;
     std::map<std::pair<int, int>, int> final_pairwise_cuts;
-  double execution_time = 0.0;
+    double execution_time = 0.0;
 
     // 解析函数
     bool parsePlacement(const std::string& line, Point& p);
@@ -136,7 +139,7 @@ private:
     // 统计辅助
     void recordInitialStats();
     void recordFinalStats();
-    void initializeCapacity();
+    // 移除 initializeCapacity(); 因为它已被 initResourceCapacity() 替代
 };
 
 #endif // FPGA_READER_H

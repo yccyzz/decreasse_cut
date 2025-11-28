@@ -1,5 +1,71 @@
 #include "fpga_reader.h"
+// 在FPGAReader类中添加
+bool FPGAReader::readCoarsenedFiles(const std::string& pl_file,
+                                    const std::string& net_file) {
+    // 读取超节点坐标
+    std::ifstream pl(pl_file);
+    std::string line;
 
+    // fpga_reader.cpp, 位于 FPGAReader::readCoarsenedFiles 函数内
+
+    while (std::getline(pl, line)) {
+        // **1. 尝试读取旧的 4 字段格式: name x die y**
+        // 这是为了兼容原始文件或其他 4 字段的输入
+        std::istringstream ss4(line);
+        std::string name;
+        int x, die, y = 0;
+        bool read_success = false;
+
+        if (ss4 >> name >> x >> die >> y) {
+            // 成功读取 4 个字段
+            read_success = true;
+        } else {
+            // **2. 如果 4 字段失败，则尝试新的 3 字段格式: name x die**
+            std::istringstream ss3(line);
+
+            if (ss3 >> name >> x >> die) {
+                // 成功读取 3 个字段
+                // 此时 y 保持为 0 (或其他默认值)
+                read_success = true;
+            }
+        }
+
+        if (read_success) {
+            // 无论 3 字段还是 4 字段成功，都将数据存储到 points
+            Point p;
+            p.name = name;
+            p.y = y;      // 如果是 3 字段格式，y 为 0；如果是 4 字段格式，y 为文件中的值
+            p.die = die;
+            p.is_fixed = false;
+            points[name] = p;
+        }
+    }
+
+    // 读取超节点连接（简单格式）
+    std::ifstream net(net_file);
+
+    while (std::getline(net, line)) {
+        std::istringstream ss(line);
+        std::string net_id, sn_i, sn_j;
+        int weight;
+
+        // 格式: net_0 supernode_0 supernode_5 8
+        if (ss >> net_id >> sn_i >> sn_j >> weight) {
+            // 创建weight个虚拟net
+            for (int w = 0; w < weight; w++) {
+                std::string virtual_net = net_id + "_" + std::to_string(w);
+
+                net_map[virtual_net].insert(sn_i);
+                net_map[virtual_net].insert(sn_j);
+
+                points[sn_i].nets.push_back(virtual_net);
+                points[sn_j].nets.push_back(virtual_net);
+            }
+        }
+    }
+
+    return true;
+}
 bool FPGAReader::readPlaceFile(const std::string& file_name) {
     std::ifstream ifs(file_name);
     if (!ifs) {

@@ -18,9 +18,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 
 # 源文件
 set(SOURCES
-    fpga_reader.cpp
+        src/fpga_reader.cpp
         main.cpp
-        fpga_reader.h
+        src/fpga_reader.h
 )
 
 # 创建可执行文件
