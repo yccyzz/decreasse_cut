@@ -6,15 +6,14 @@ bool FPGAReader::readPlaceFile(const std::string& file_name) {
         std::cerr << "cannot open : " << file_name << "\n";
         return false;
     }
-
     clear();
-
     std::string line;
     points.reserve(50000);
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
         Point p;
-        if (parsePlacement(line, p) && !is_coarsing) {
+        parsePlacement(line, p);
+        if (!is_coarsing) {
             if (p.y < 120) {
                 p.die = 0;
             }else if(p.y < 240) {
@@ -24,10 +23,44 @@ bool FPGAReader::readPlaceFile(const std::string& file_name) {
             }else {
                 p.die = 3;
             }
-            points.insert({p.name, std::move(p)});
         }
+        points.insert({p.name, std::move(p)});
     }
     detectDieMode();
+    return true;
+}
+
+bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
+    std::istringstream ss(line);
+    std::string name, x, z, last;
+    int y,die;
+    if(!is_coarsing){
+        if (!(ss >> name >> x >> y >> z)) return false;
+        p.name = name;
+        p.y = y;
+        p.is_fixed = false;
+        p.is_originally_fixed = false;
+
+        if (ss >> last && last == "FIXED") {
+            p.is_fixed = true;
+            p.is_originally_fixed = true;
+        }
+    } else{
+        if (!(ss >> name >> y >> die)) return false;
+        p.name = name;
+        p.die = die;
+        if(die != 0 && die != 1){
+            std::cout<<die<<std::endl;}
+        p.y = die * 60 + 120.0;
+        p.is_fixed = false;
+        p.is_originally_fixed = false;
+
+        if (ss >> last && last == "FIXED") {
+            p.is_fixed = true;
+            p.is_originally_fixed = true;
+        }
+    }
+
     return true;
 }
 
@@ -80,49 +113,16 @@ bool FPGAReader::readNetFile(std::string& file_name) {
     return true;
 }
 
-bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
-    std::istringstream ss(line);
-    std::string name, x, z, last;
-    int y,die;
-    if(!is_coarsing){
-    if (!(ss >> name >> x >> y >> z)) return false;
-    p.name = name;
-    p.y = y;
-    p.is_fixed = false;
-    p.is_originally_fixed = false; // 【新增】初始化
-
-    if (ss >> last && last == "FIXED") {
-        p.is_fixed = true;
-        p.is_originally_fixed = true; // 【修改】记录原始 FIXED 状态
-    }
-    } else{
-        if (!(ss >> name >> y >> die)) return false;
-        p.name = name;
-        p.y = y;
-        p.die = die;
-        p.is_fixed = false;
-        p.is_originally_fixed = false;
-
-        if (ss >> last && last == "FIXED") {
-            p.is_fixed = true;
-            p.is_originally_fixed = true;
-        }
-    }
-
-    return true;
-}
 
 void FPGAReader::parseNet(std::string& content) {
     std::replace(content.begin(), content.end(), '\n', ' ');
-    std::regex inst_re(R"(([\w]+)\s+([\w.]+)\s*\((.*?)\);)", std::regex::icase);
-    std::regex net_re(R"(\.\w+\((net_\d+)\))");
-
+    std::regex inst_re(R"(([\w]+)\s*([\w.]*)\s*\(([\s\S]*?)\);)", std::regex::icase);
+    std::regex net_re(R"(\.[\w\.]+\s*\(([\w\.]*)\))");
     std::unordered_map<std::string, std::vector<std::string>> temp_point_nets;
     std::unordered_map<std::string, std::unordered_set<std::string>> temp_net_to_points;
     temp_point_nets.reserve(points.size());
     temp_net_to_points.reserve(points.size());
     net_map.reserve(50000);
-
     for (std::sregex_iterator it(content.begin(), content.end(), inst_re), end;
          it != end; ++it) {
         const auto& m = *it;
@@ -143,7 +143,6 @@ void FPGAReader::parseNet(std::string& content) {
             temp_net_to_points[net_name].insert(inst_name);
         }
     }
-
     for (const auto& [net_name, point_list] : temp_net_to_points) {
         auto& net_points = net_map[net_name];
         net_points.reserve(point_list.size());
@@ -162,9 +161,10 @@ void FPGAReader::parseNet(std::string& content) {
             for (const auto& net_name : net_list) {
                 point.nets.emplace_back(net_name);
             }
+        }else {
+            std::cout << point.name << "not found in temp_point_nets." << std::endl;
         }
     }
-
     invalidateNetworkStatsCache();
 }
 
