@@ -1,71 +1,5 @@
 #include "fpga_reader.h"
-// 在FPGAReader类中添加
-bool FPGAReader::readCoarsenedFiles(const std::string& pl_file,
-                                    const std::string& net_file) {
-    // 读取超节点坐标
-    std::ifstream pl(pl_file);
-    std::string line;
 
-    // fpga_reader.cpp, 位于 FPGAReader::readCoarsenedFiles 函数内
-
-    while (std::getline(pl, line)) {
-        // **1. 尝试读取旧的 4 字段格式: name x die y**
-        // 这是为了兼容原始文件或其他 4 字段的输入
-        std::istringstream ss4(line);
-        std::string name;
-        int x, die, y = 0;
-        bool read_success = false;
-
-        if (ss4 >> name >> x >> die >> y) {
-            // 成功读取 4 个字段
-            read_success = true;
-        } else {
-            // **2. 如果 4 字段失败，则尝试新的 3 字段格式: name x die**
-            std::istringstream ss3(line);
-
-            if (ss3 >> name >> x >> die) {
-                // 成功读取 3 个字段
-                // 此时 y 保持为 0 (或其他默认值)
-                read_success = true;
-            }
-        }
-
-        if (read_success) {
-            // 无论 3 字段还是 4 字段成功，都将数据存储到 points
-            Point p;
-            p.name = name;
-            p.y = y;      // 如果是 3 字段格式，y 为 0；如果是 4 字段格式，y 为文件中的值
-            p.die = die;
-            p.is_fixed = false;
-            points[name] = p;
-        }
-    }
-
-    // 读取超节点连接（简单格式）
-    std::ifstream net(net_file);
-
-    while (std::getline(net, line)) {
-        std::istringstream ss(line);
-        std::string net_id, sn_i, sn_j;
-        int weight;
-
-        // 格式: net_0 supernode_0 supernode_5 8
-        if (ss >> net_id >> sn_i >> sn_j >> weight) {
-            // 创建weight个虚拟net
-            for (int w = 0; w < weight; w++) {
-                std::string virtual_net = net_id + "_" + std::to_string(w);
-
-                net_map[virtual_net].insert(sn_i);
-                net_map[virtual_net].insert(sn_j);
-
-                points[sn_i].nets.push_back(virtual_net);
-                points[sn_j].nets.push_back(virtual_net);
-            }
-        }
-    }
-
-    return true;
-}
 bool FPGAReader::readPlaceFile(const std::string& file_name) {
     std::ifstream ifs(file_name);
     if (!ifs) {
@@ -80,7 +14,7 @@ bool FPGAReader::readPlaceFile(const std::string& file_name) {
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
         Point p;
-        if (parsePlacement(line, p)) {
+        if (parsePlacement(line, p) && !is_coarsing) {
             if (p.y < 120) {
                 p.die = 0;
             }else if(p.y < 240) {
@@ -133,6 +67,7 @@ void FPGAReader::clear() {
     execution_time = 0.0;
 }
 
+
 bool FPGAReader::readNetFile(std::string& file_name) {
     std::ifstream ifs(file_name);
     if (!ifs) {
@@ -145,12 +80,11 @@ bool FPGAReader::readNetFile(std::string& file_name) {
     return true;
 }
 
-// fpga_reader.cpp
 bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
     std::istringstream ss(line);
     std::string name, x, z, last;
-    int y;
-
+    int y,die;
+    if(!is_coarsing){
     if (!(ss >> name >> x >> y >> z)) return false;
     p.name = name;
     p.y = y;
@@ -160,6 +94,19 @@ bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
     if (ss >> last && last == "FIXED") {
         p.is_fixed = true;
         p.is_originally_fixed = true; // 【修改】记录原始 FIXED 状态
+    }
+    } else{
+        if (!(ss >> name >> y >> die)) return false;
+        p.name = name;
+        p.y = y;
+        p.die = die;
+        p.is_fixed = false;
+        p.is_originally_fixed = false;
+
+        if (ss >> last && last == "FIXED") {
+            p.is_fixed = true;
+            p.is_originally_fixed = true;
+        }
     }
 
     return true;
@@ -816,16 +763,6 @@ void FPGAReader::updateGainQueue() {
         }
     }
 }
-// fpga_reader.cpp
-
-// ==================== 输出函数 (已修改) ====================
-
-/**
- * @brief 将当前的点位（Point）信息输出到一个新的布局文件（FPGA_FM_output.place）。
- * 输出格式兼容 readPlaceFile，以便于被主程序继续读取运行。
- * 格式: name x y z [FIXED]
- * 仅当点在输入文件时就被标记为 FIXED 时，才输出 FIXED。
- */
 void FPGAReader::print_Info() const {
     std::string output_file_name = "../FPGA_FM_output.place";
     std::ofstream ofs(output_file_name);
@@ -838,11 +775,11 @@ void FPGAReader::print_Info() const {
     for (const auto& pair : points) {
         const Point& p = pair.second;
 
-        // 格式: name x y z [FIXED]
-        // 假设 X=0, Z=0，使用 Point 结构体中存储的 Y 坐标
-        ofs << p.name << " 0 " << p.y << " 0";
+        // 【修改】新格式: name y die [FIXED]
+        // x 坐标取整，die 直接使用 Point.die
+        ofs << p.name << " " << (int)p.y << " " << p.die;
 
-        // 【修改】仅当点在输入时就为 FIXED 时，才输出 FIXED
+        // 仅当点在输入时就为 FIXED 时，才输出 FIXED
         if (p.is_originally_fixed) {
             ofs << " FIXED";
         }
@@ -851,8 +788,8 @@ void FPGAReader::print_Info() const {
     }
 
     std::cout << "Successfully saved FM output to: " << output_file_name << "\n";
-    std::cout << "This file can be re-read by FPGAReader::readPlaceFile.\n";
 }
+
 void FPGAReader::saveResultsToExcel(const std::string& excel_file) {
     bool file_exists = std::ifstream(excel_file).good();
 

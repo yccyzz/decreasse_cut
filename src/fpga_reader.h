@@ -37,13 +37,11 @@ public:
     static constexpr double GAIN_WEIGHT = 100.0;
     static constexpr double UTILIZATION_SOFT_THRESHOLD = 0.6;
     static constexpr double UTILIZATION_HARD_THRESHOLD = 0.9;
+    bool is_coarsing = false;
 
-    // 基础文件读取
     bool readPlaceFile(const std::string& file_name);
     bool readNetFile(std::string& file_name);
-    // 新增：读取超节点文件
-    bool readCoarsenedFiles(const std::string& pl_file,
-                            const std::string& net_file);
+
 
     // FM算法
     void FM();
