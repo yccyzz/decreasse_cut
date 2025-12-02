@@ -49,9 +49,10 @@ bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
         if (!(ss >> name >> y >> die)) return false;
         p.name = name;
         p.die = die;
-        if(die != 0 && die != 1){
-            std::cout<<die<<std::endl;}
-        p.y = die * 60 + 120.0;
+        if (die < 0 || die > 3) {
+            std::cout << die << std::endl;
+        }
+        p.y = die * 120.0 + 120.0;
         p.is_fixed = false;
         p.is_originally_fixed = false;
 
