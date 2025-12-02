@@ -52,7 +52,7 @@ bool FPGAReader::parsePlacement(const std::string& line, Point& p) {
         if (die < 0 || die > 3) {
             std::cout << die << std::endl;
         }
-        p.y = die * 120.0 + 120.0;
+        p.y = die * 120.0 + 60.0;
         p.is_fixed = false;
         p.is_originally_fixed = false;
 
@@ -163,7 +163,7 @@ void FPGAReader::parseNet(std::string& content) {
                 point.nets.emplace_back(net_name);
             }
         }else {
-            std::cout << point.name << "not found in temp_point_nets." << std::endl;
+            std::cout << point.name << " not found in temp_point_nets." << std::endl;
         }
     }
     invalidateNetworkStatsCache();
