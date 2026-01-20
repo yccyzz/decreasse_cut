@@ -2,12 +2,12 @@
 
 int main() {
     FPGAReader reader;
-    std::string placement_file = "C:\\Users\\Lenovo\\Desktop\\plresults\\FPGA01.pl";
-    std::string netlist_file = "C:\\Users\\Lenovo\\Desktop\\ispd2016_flexshelf\\FPGA01\\design-without.osv";
+    std::string placement_file = "C:\\Users\\Lenovo\\coarsing\\coarsened_FPGA12.pl";
+    std::string netlist_file = "C:\\Users\\Lenovo\\coarsing\\coarsened_FPGA12.net";
     std::filesystem::path p(placement_file);
     reader.filename = p.filename().string();
 
-    reader.is_coarsing = false;
+    reader.is_coarsing = true;
     std::cout << reader.filename << std::endl;
 
     if (!reader.readPlaceFile(placement_file) || !reader.readNetFile(netlist_file)) {
